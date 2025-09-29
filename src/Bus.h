@@ -6,8 +6,9 @@
 
 #pragma once
 
-#include <Embedded_Template_Library.h> // Mandatory for Arduino IDE only
-#include <etl/vector.h>
+#include <vector>
+#include <algorithm>
+#include <functional>
 
 #include "ln_opc.h"
 
@@ -57,10 +58,10 @@ public:
 
     void removeConsumer (MsgConsumer * c)
     {
-        consumers.erase (etl::remove (consumers.begin(), consumers.end(), c), consumers.end());
+        consumers.erase (std::remove (consumers.begin(), consumers.end(), c), consumers.end());
     }
 
 private:
-    etl::vector<MsgConsumer*, MAX_CONSUMERS> consumers;
+    std::vector<MsgConsumer*, MAX_CONSUMERS> consumers;
 };
 
