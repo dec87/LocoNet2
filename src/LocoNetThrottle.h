@@ -176,4 +176,7 @@ private:
     std::function<void (LocoNetThrottle *, TH_STATE, TH_STATE) > stateCallback;
     std::function<void (LocoNetThrottle *, TH_SPEED_STEPS) > speedStepsChangeCallback;
     std::function<void (LocoNetThrottle *, TH_ERROR) > errorCallback;
+    std::function<void (LocoNetThrottle*, TH_STATE, TH_STATE)> throttleStateCallback;
+    std::function<void (LocoNetThrottle*, uint8_t)> throttleSlotStateCallback;
+    std::function<void(LocoNetThrottle*, TH_ERROR)> throttleErrorCallback;
 };

@@ -63,290 +63,774 @@
  *
  *****************************************************************************/
 
-#include "LocoNetSVCV.h"
-#include <EEPROM.h>
+#include "LocoNetThrottle.h"
 
-uint8_t LocoNetSystemVariable::readSVStorage (uint16_t Offset)
+LocoNetThrottle::LocoNetThrottle (LocoNetDispatcher *locoNet) :
+    _locoNet (locoNet), _state (TH_ST_FREE), _ticksSinceLastAction (0), _slot (0xFF),
+    _address (0), _speed (0), _deferredSpeed (0), _status1 (0), _dirFunc0to4 (0), _func5to8 (0),
+    _userData (0), _options (0), _throttleId (0)
+{};
+
+void LocoNetThrottle::init (uint8_t userData, uint8_t options, uint16_t throttleId)
 {
-    return EEPROM.read (Offset);
+    _userData = userData;
+    _options = options;
+    _throttleId = throttleId;
+    _locoNet->onPacket (OPC_SL_RD_DATA, std::bind (&LocoNetThrottle::processMessage, this, std::placeholders::_1));
+    _locoNet->onPacket (OPC_LOCO_SPD, std::bind (&LocoNetThrottle::processMessage, this, std::placeholders::_1));
+    _locoNet->onPacket (OPC_LOCO_DIRF, std::bind (&LocoNetThrottle::processMessage, this, std::placeholders::_1));
+    _locoNet->onPacket (OPC_LOCO_SND, std::bind (&LocoNetThrottle::processMessage, this, std::placeholders::_1));
+    _locoNet->onPacket (OPC_SLOT_STAT1, std::bind (&LocoNetThrottle::processMessage, this, std::placeholders::_1));
+    _locoNet->onPacket (OPC_LONG_ACK, std::bind (&LocoNetThrottle::processMessage, this, std::placeholders::_1));
 }
 
-uint8_t LocoNetSystemVariable::writeSVStorage (uint16_t Offset, uint8_t Value)
+// LocoNet Throttle Support
+// To make it easier to handle the Speed steps 0 = Stop, 1 = Em Stop and 2 -127
+// normal speed steps we will swap speed steps 0 and 1 so that the normal
+// range for speed steps is Stop = 1 2-127 is normal as before and now 0 = EmStop
+static uint8_t SwapSpeedZeroAndEmStop (uint8_t Speed)
 {
-    if (EEPROM.read (Offset) != Value)
-        EEPROM.write (Offset, Value);
-
-    return Value;
-}
-
-LocoNetSystemVariable::LocoNetSystemVariable (LocoNet &locoNet, uint8_t mfgId, uint8_t devId, uint16_t productId, uint8_t swVersion) :
-    _locoNet (locoNet), _mfgId (mfgId), _devId (devId), _productId (productId), _swVersion (swVersion), _deferredProcessingRequired (false), _deferredSrcAddr (0)
-{
-    _locoNet.onPacket (OPC_PEER_XFER, [this] (const lnMsg *rxPacket)
+    if (Speed == 0)
     {
-        this->processMessage (rxPacket);
-    });
-}
-
-uint8_t LocoNetSystemVariable::isSVStorageValid (uint16_t Offset)
-{
-    #ifdef E2END
-    return (Offset >= SV_ADDR_EEPROM_SIZE) && (Offset <= E2END + 2);
-    #else
-    return (Offset >= SV_ADDR_EEPROM_SIZE) && (Offset <= 0xFF + 2);
-    #endif
-}
-
-bool LocoNetSystemVariable::CheckAddressRange (uint16_t startAddress, uint8_t Count)
-{
-    while (Count != 0)
+        return 1;
+    }
+    else if (Speed == 1)
     {
-        if (!isSVStorageValid (startAddress))
+        return 0;
+    }
+    return Speed;
+}
+
+void LocoNetThrottle::updateAddress (uint16_t Address, uint8_t ForceNotify)
+{
+    if (ForceNotify || _address != Address)
+    {
+        uint16_t oldAddess = _address;
+        _address = Address;
+        if (addressChangeCallback)
         {
-            _locoNet.send (OPC_LONG_ACK, (OPC_PEER_XFER & 0x7F), 42); // report invalid SV address error
-            return false;
+            addressChangeCallback (this, _address, oldAddess);
         }
-        startAddress++;
-        Count--;
+    }
+}
+
+void LocoNetThrottle::updateSpeed (uint8_t Speed, uint8_t ForceNotify)
+{
+    if (ForceNotify || _speed != Speed)
+    {
+        _speed = Speed;
+        if (speedChangeCallback)
+        {
+            speedChangeCallback (this, SwapSpeedZeroAndEmStop (Speed));
+        }
+    }
+}
+
+void LocoNetThrottle::updateState (TH_STATE State, uint8_t ForceNotify)
+{
+    if (ForceNotify || _state != State)
+    {
+        TH_STATE PrevState = _state;
+        _state = State;
+        if (throttleStateCallback)
+        {
+            throttleStateCallback (this, State, PrevState);
+        }
+    }
+}
+
+void LocoNetThrottle::updateStatus1 (uint8_t Status, uint8_t ForceNotify)
+{
+    if (ForceNotify || _status1 != Status)
+    {
+        _status1 = Status;
+        if (throttleSlotStateCallback)
+        {
+            throttleSlotStateCallback (this, Status);
+        }
+        updateState (Status & LOCO_IN_USE ? TH_ST_IN_USE : TH_ST_FREE, ForceNotify);
+    }
+}
+
+void LocoNetThrottle::updateDirectionAndFunctions (uint8_t DirFunc0to4, uint8_t ForceNotify)
+{
+    if (ForceNotify || _dirFunc0to4 != DirFunc0to4)
+    {
+        uint8_t Diffs = _dirFunc0to4 ^ DirFunc0to4;
+        _dirFunc0to4 = DirFunc0to4;
+        if (functionChangeCallback)
+        {
+            // Check Functions 1-4
+            for (uint8_t function = 1, Mask = 1; function <= 4; function++, Mask <<= 1)
+            {
+                if (ForceNotify || Diffs & Mask)
+                {
+                    functionChangeCallback (this, function, DirFunc0to4 & Mask);
+                }
+            }
+
+            // Check Functions 0
+            if (ForceNotify || Diffs & DIRF_F0)
+            {
+                functionChangeCallback (this, 0, DirFunc0to4 & DIRF_F0);
+            }
+        }
+        // Check Direction
+        if (directionChangeCallback && (ForceNotify || Diffs & DIRF_DIR))
+        {
+            directionChangeCallback (this, DirFunc0to4 & DIRF_DIR);
+        }
+    }
+}
+
+void LocoNetThrottle::updateFunctions5to8 (uint8_t Func5to8, uint8_t ForceNotify)
+{
+    if (functionChangeCallback)
+    {
+        if (ForceNotify || _func5to8 != Func5to8)
+        {
+            uint8_t Diffs = _func5to8 ^ Func5to8;
+            _func5to8 = Func5to8;
+
+            // Check Functions 5-8
+            for (uint8_t Function = 5, Mask = 1; Function <= 8; Function++, Mask <<= 1)
+            {
+                if (ForceNotify || Diffs & Mask)
+                {
+                    functionChangeCallback (this, Function, Func5to8 & Mask);
+                }
+            }
+        }
+    }
+}
+
+void LocoNetThrottle::updateSpeedSteps (TH_SPEED_STEPS SpeedSteps, uint8_t ForceNotify)
+{
+    if (speedStepsChangeCallback)
+    {
+        if (ForceNotify || ( (_status1 & 0x07) != SpeedSteps))
+        {
+            _status1 = (_status1 & 0xF8) | SpeedSteps;
+
+            speedStepsChangeCallback (this, SpeedSteps);
+        }
+    }
+}
+
+constexpr uint16_t SLOT_REFRESH_TICKS = 600;   // 600 * 100ms = 60 seconds between speed refresh
+
+void LocoNetThrottle::process100msActions (void)
+{
+    if (_state == TH_ST_IN_USE)
+    {
+        _ticksSinceLastAction++;
+
+        if (_deferredSpeed || _ticksSinceLastAction > SLOT_REFRESH_TICKS)
+        {
+            _locoNet->send (OPC_LOCO_SPD, _slot, _deferredSpeed ? _deferredSpeed : _speed);
+            if (_deferredSpeed)
+            {
+                _deferredSpeed = 0;
+            }
+            _ticksSinceLastAction = 0;
+        }
+    }
+}
+
+void LocoNetThrottle::processMessage (const lnMsg *LnPacket)
+{
+    uint8_t  Data2;
+    uint16_t  SlotAddress;
+
+    // Update our copy of slot information if applicable
+    if (LnPacket->sd.command == OPC_SL_RD_DATA)
+    {
+        SlotAddress = (uint16_t) ( (LnPacket->sd.adr2 << 7) + LnPacket->sd.adr);
+
+        if (_slot == LnPacket->sd.slot)
+        {
+            // Make sure that the slot address matches even though we have the right slot number
+            // as it is possible that another throttle got in before us and took our slot.
+            if (_address == SlotAddress)
+            {
+                if (_state == TH_ST_SLOT_RESUME && _throttleId != (uint16_t) ( (LnPacket->sd.id2 << 7) + LnPacket->sd.id1))
+                {
+                    updateState (TH_ST_FREE, 1);
+                    if (throttleErrorCallback)
+                    {
+                        throttleErrorCallback (this, TH_ER_NO_LOCO);
+                    }
+                }
+                else
+                {
+                    updateState (TH_ST_IN_USE, 1);
+                    updateAddress (SlotAddress, 1);
+                    updateSpeed (LnPacket->sd.spd, 1);
+                    updateDirectionAndFunctions (LnPacket->sd.dirf, 1);
+                    updateFunctions5to8 (LnPacket->sd.snd, 1);
+
+                    updateSpeedSteps (_speedSteps, 1);
+
+                    // We need to force a State update to cause a display refresh once all data is known
+                    updateState (TH_ST_IN_USE, 1);
+
+                    // Now Write our own Throttle Id to the slot and write it back to the command station
+                    lnMsg txPacket = *LnPacket;
+                    txPacket.sd.command = OPC_WR_SL_DATA;
+                    txPacket.sd.stat = (LnPacket->sd.stat & 0xf8) | _speedSteps;
+
+                    txPacket.sd.id1 = (uint8_t) (_throttleId & 0x7F);
+                    txPacket.sd.id2 = (uint8_t) (_throttleId >> 7);
+
+                    _locoNet->send (&txPacket);
+                }
+            }
+
+            // Ok another throttle did a NULL MOVE with the same slot before we did
+            // so we have to try again
+            else if (_state == TH_ST_SLOT_MOVE)
+            {
+                updateState (TH_ST_SELECT, 1);
+                _locoNet->send (OPC_LOCO_ADR, (uint8_t) (_address >> 7), (uint8_t) (_address & 0x7F));
+            }
+        }
+        // Slot data is not for one of our slots so check if we have requested a new addres
+        else
+        {
+            if (_address == SlotAddress)
+            {
+                if (_state == TH_ST_SELECT || _state == TH_ST_DISPATCH)
+                {
+                    if ( (LnPacket->sd.stat & STAT1_SL_CONUP) == 0 &&
+                            (LnPacket->sd.stat & LOCO_IN_USE) != LOCO_IN_USE)
+                    {
+                        if (_state == TH_ST_SELECT)
+                        {
+                            updateState (TH_ST_SLOT_MOVE, 1);
+                            _slot = LnPacket->sd.slot;
+                            Data2 = LnPacket->sd.slot;
+                        }
+                        else
+                        {
+                            updateState (TH_ST_FREE, 1);
+                            Data2 = 0;
+                        }
+
+                        _locoNet->send (OPC_MOVE_SLOTS, LnPacket->sd.slot, Data2);
+                    }
+                    else
+                    {
+                        if (throttleErrorCallback)
+                            throttleErrorCallback (this, TH_ER_SLOT_IN_USE);
+                        updateState (TH_ST_FREE, 1);
+                    }
+                }
+                else if (_state == TH_ST_SLOT_STEAL)
+                {
+                    // Make Sure the Slot is actually IN_USE already as we are not going to do an SLOT_MOVE etc
+                    if ( (LnPacket->sd.stat & STAT1_SL_CONUP) == 0 &&
+                            (LnPacket->sd.stat & LOCO_IN_USE) == LOCO_IN_USE)
+                    {
+                        _slot = LnPacket->sd.slot;
+
+                        updateState (TH_ST_IN_USE, 1);
+
+                        updateAddress (SlotAddress, 1);
+                        updateSpeed (LnPacket->sd.spd, 1);
+                        updateDirectionAndFunctions (LnPacket->sd.dirf, 1);
+                        updateFunctions5to8 (LnPacket->sd.snd, 1);
+                        updateStatus1 (LnPacket->sd.stat, 1);
+
+                        // We need to force a State update to cause a display refresh once all data is known
+                        updateState (TH_ST_IN_USE, 1);
+                    }
+                    else
+                    {
+                        if (throttleErrorCallback)
+                            throttleErrorCallback (this, TH_ER_NO_LOCO);
+                        updateState (TH_ST_FREE, 1);
+                    }
+                }
+                else if (_state == TH_ST_SLOT_FORCE_FREE)
+                {
+                    _locoNet->send (OPC_SLOT_STAT1, LnPacket->sd.slot, (uint8_t) (_status1 & ~ (STAT1_SL_BUSY | STAT1_SL_ACTIVE)));
+                    _slot = 0xFF;
+                    updateState (TH_ST_FREE, 1);
+                }
+            }
+
+            if (_state == TH_ST_ACQUIRE)
+            {
+                _slot = LnPacket->sd.slot;
+                updateState (TH_ST_IN_USE, 1);
+
+                updateAddress (SlotAddress, 1);
+                updateSpeed (LnPacket->sd.spd, 1);
+                updateDirectionAndFunctions (LnPacket->sd.dirf, 1);
+                updateStatus1 (LnPacket->sd.stat, 1);
+            }
+        }
+    }
+    else if ( ( (LnPacket->sd.command >= OPC_LOCO_SPD) && (LnPacket->sd.command <= OPC_LOCO_SND)) ||
+              (LnPacket->sd.command == OPC_SLOT_STAT1))
+    {
+        if (_slot == LnPacket->ld.slot)
+        {
+            if (LnPacket->ld.command == OPC_LOCO_SPD)
+            {
+                updateSpeed (LnPacket->ld.data, 0);
+            }
+            else if (LnPacket->ld.command == OPC_LOCO_DIRF)
+            {
+                updateDirectionAndFunctions (LnPacket->ld.data, 0);
+            }
+            else if (LnPacket->ld.command == OPC_LOCO_SND)
+            {
+                updateFunctions5to8 (LnPacket->ld.data, 0);
+            }
+            else if (LnPacket->ld.command == OPC_SLOT_STAT1)
+            {
+                updateStatus1 (LnPacket->ld.data, 0);
+            }
+        }
+    }
+    else if (LnPacket->lack.command == OPC_LONG_ACK)
+    {
+        if (_state >= TH_ST_ACQUIRE && _state <= TH_ST_SLOT_MOVE)
+        {
+            if (LnPacket->lack.opcode == (OPC_MOVE_SLOTS & 0x7F) && throttleErrorCallback)
+            {
+                throttleErrorCallback (this, TH_ER_NO_LOCO);
+            }
+            if (LnPacket->lack.opcode == (OPC_LOCO_ADR & 0x7F) && throttleErrorCallback)
+            {
+                throttleErrorCallback (this, TH_ER_NO_SLOTS);
+            }
+
+            updateState (TH_ST_FREE, 1);
+        }
+    }
+}
+
+uint16_t LocoNetThrottle::getAddress (void)
+{
+    return _address;
+}
+
+TH_ERROR LocoNetThrottle::setAddress (uint16_t Address)
+{
+    if (_state == TH_ST_FREE)
+    {
+        updateAddress (Address, 1);
+        updateState (TH_ST_SELECT, 1);
+
+        _locoNet->send (OPC_LOCO_ADR, (uint8_t) (Address >> 7), (uint8_t) (Address & 0x7F));
+        return TH_ER_OK;
     }
 
-    return true; // all valid
+    if (throttleErrorCallback)
+    {
+        throttleErrorCallback (this, TH_ER_BUSY);
+    }
+    return TH_ER_BUSY;
 }
 
-uint16_t LocoNetSystemVariable::writeSVNodeId (uint16_t newNodeId)
+TH_ERROR LocoNetThrottle::stealAddress (uint16_t Address)
 {
-    writeSVStorage (SV_ADDR_NODE_ID_H, newNodeId >> 8);
-    writeSVStorage (SV_ADDR_NODE_ID_L, newNodeId & 0xFF);
-    return readSVNodeId();
+    if (_state <= TH_ST_RELEASE)
+    {
+        updateAddress (Address, 1);
+        updateState (TH_ST_SLOT_STEAL, 1);
+
+        _locoNet->send (OPC_LOCO_ADR, (uint8_t) (Address >> 7), (uint8_t) (Address & 0x7F));
+        return TH_ER_OK;
+    }
+
+    if (throttleErrorCallback)
+        throttleErrorCallback (this, TH_ER_BUSY);
+    return TH_ER_BUSY;
 }
 
-uint16_t LocoNetSystemVariable::readSVNodeId()
+
+TH_ERROR LocoNetThrottle::resumeAddress (uint16_t Address, uint8_t LastSlot)
 {
-    return (readSVStorage (SV_ADDR_NODE_ID_H) << 8) | readSVStorage (SV_ADDR_NODE_ID_L);
+    if (_state == TH_ST_FREE)
+    {
+        _slot = LastSlot;
+        updateAddress (Address, 1);
+        updateState (TH_ST_SLOT_RESUME, 1);
+
+        _locoNet->send (OPC_RQ_SL_DATA, LastSlot, 0);
+        return TH_ER_OK;
+    }
+
+    if (throttleErrorCallback)
+    {
+        throttleErrorCallback (this, TH_ER_BUSY);
+    }
+    return TH_ER_BUSY;
 }
 
-typedef union
+TH_ERROR LocoNetThrottle::freeAddress (void)
 {
-    uint16_t                  w;
-    struct
+    if (_state == TH_ST_IN_USE)
     {
-        uint8_t lo,hi;
-    } b;
-} U16_t;
+        _locoNet->send (OPC_SLOT_STAT1, _slot, (uint8_t) (_status1 & ~ (STAT1_SL_BUSY | STAT1_SL_ACTIVE)));
 
-typedef union
-{
-    struct
-    {
-        U16_t unDestinationId;
-        U16_t unMfgIdDevIdOrSvAddress;
-        U16_t unproductId;
-        U16_t unSerialNumber;
-    } stDecoded;
-    uint8_t abPlain[8];
-} SV_Addr_t;
+        _slot = 0xFF;
+        updateState (TH_ST_FREE, 1);
+        return TH_ER_OK;
+    }
 
-void decodePeerData (peerXferMsg *pMsg, uint8_t *pOutData)
+    if (throttleErrorCallback)
+        throttleErrorCallback (this, TH_ER_NOT_SELECTED);
+    return TH_ER_NOT_SELECTED;
+}
+
+
+TH_ERROR LocoNetThrottle::freeAddressForce (uint16_t Address)
 {
-    uint8_t bitMask = 0x01;
-    uint8_t * pInData = &pMsg->d1;
-    uint8_t * pBits = &pMsg->pxct1;
-    for (uint8_t index = 0; index < 8; index++)
+    if (_state <= TH_ST_RELEASE)
     {
-        pOutData[index] = *pInData;
-        if (*pBits & bitMask)
+        updateAddress (Address, 1);
+        updateState (TH_ST_SLOT_FORCE_FREE, 1);
+
+        _locoNet->send (OPC_LOCO_ADR, (uint8_t) (Address >> 7), (uint8_t) (Address & 0x7F));
+        return TH_ER_OK;
+    }
+
+    if (throttleErrorCallback)
+    {
+        throttleErrorCallback (this, TH_ER_BUSY);
+    }
+    return TH_ER_BUSY;
+}
+
+TH_ERROR LocoNetThrottle::dispatchAddress (void)
+{
+    if (_state == TH_ST_IN_USE)
+    {
+        updateState (TH_ST_FREE, 1);
+        _locoNet->send (OPC_MOVE_SLOTS, _slot, 0);
+        return TH_ER_OK;
+    }
+
+    if (throttleErrorCallback)
+        throttleErrorCallback (this, TH_ER_NOT_SELECTED);
+    return TH_ER_NOT_SELECTED;
+}
+
+TH_ERROR LocoNetThrottle::dispatchAddress (uint16_t Address)
+{
+    if (_state <= TH_ST_RELEASE)
+    {
+        updateAddress (Address, 1);
+        updateState (TH_ST_DISPATCH, 1);
+
+        _locoNet->send (OPC_LOCO_ADR, (uint8_t) (Address >> 7), (uint8_t) (Address & 0x7F));
+        return TH_ER_OK;
+    }
+
+    if (throttleErrorCallback)
+    {
+        throttleErrorCallback (this, TH_ER_BUSY);
+    }
+    return TH_ER_BUSY;
+}
+
+TH_ERROR LocoNetThrottle::acquireAddress (void)
+{
+    if (_state == TH_ST_FREE)
+    {
+        updateState (TH_ST_ACQUIRE, 1);
+        _locoNet->send (OPC_MOVE_SLOTS, 0, 0);
+        return TH_ER_OK;
+    }
+
+    if (throttleErrorCallback)
+    {
+        throttleErrorCallback (this, TH_ER_BUSY);
+    }
+    return TH_ER_BUSY;
+}
+
+void LocoNetThrottle::releaseAddress (void)
+{
+    if (_state == TH_ST_IN_USE)
+    {
+        _locoNet->send (OPC_SLOT_STAT1, _slot, (uint8_t) (_status1 & ~STAT1_SL_BUSY));
+    }
+    _slot = 0xFF;
+    updateState (TH_ST_FREE, 1);
+}
+
+TH_ERROR LocoNetThrottle::idleAddress (void)
+{
+    if (_state == TH_ST_IN_USE)
+    {
+        _locoNet->send (OPC_SLOT_STAT1, _slot, (uint8_t) (_status1 & ~ (STAT1_SL_ACTIVE)));
+
+        _slot = 0xFF;
+        updateState (TH_ST_IDLE, 1);
+        return TH_ER_OK;
+    }
+
+    if (throttleErrorCallback)
+        throttleErrorCallback (this, TH_ER_NOT_SELECTED);
+    return TH_ER_NOT_SELECTED;
+}
+
+uint8_t LocoNetThrottle::getSpeed (void)
+{
+    return SwapSpeedZeroAndEmStop (_speed);
+}
+
+TH_ERROR LocoNetThrottle::setSpeed (uint8_t Speed)
+{
+    if (_state == TH_ST_IN_USE)
+    {
+        Speed = SwapSpeedZeroAndEmStop (Speed);
+        if (_speed != Speed)
         {
-            pOutData[index] |= 0x80;
+            // Always defer any speed other than stop or em stop
+            if ( (_options & TH_OP_DEFERRED_SPEED) &&
+                    ( (Speed > 1) || !_ticksSinceLastAction))
+            {
+                _deferredSpeed = Speed;
+            }
+            else
+            {
+                _locoNet->send (OPC_LOCO_SPD, _slot, Speed);
+                _ticksSinceLastAction = 0;
+                _deferredSpeed = 0;
+            }
         }
-        if (index == 3)
+        return TH_ER_OK;
+    }
+
+    if (throttleErrorCallback)
+    {
+        throttleErrorCallback (this, TH_ER_NOT_SELECTED);
+    }
+    return TH_ER_NOT_SELECTED;
+}
+
+uint8_t LocoNetThrottle::getDirection (void)
+{
+    return _dirFunc0to4 & (uint8_t) DIRF_DIR;
+}
+
+TH_ERROR LocoNetThrottle::setDirection (uint8_t Direction)
+{
+    if (_state == TH_ST_IN_USE)
+    {
+        _locoNet->send (OPC_LOCO_DIRF, _slot, Direction ? (uint8_t) (_dirFunc0to4 | DIRF_DIR) : (uint8_t) (_dirFunc0to4 & ~DIRF_DIR));
+
+        _ticksSinceLastAction = 0;
+        return TH_ER_OK;
+    }
+
+    if (throttleErrorCallback)
+    {
+        throttleErrorCallback (this, TH_ER_NOT_SELECTED);
+    }
+    return TH_ER_NOT_SELECTED;
+}
+
+uint8_t LocoNetThrottle::getFunction (uint8_t Function)
+{
+    uint8_t Mask;
+
+    if (Function <= 4)
+    {
+        Mask = (uint8_t) (1 << ( (Function) ? Function - 1 : 4));
+        return _dirFunc0to4 & Mask;
+    }
+
+    Mask = (uint8_t) (1 << (Function - 5));
+    return _func5to8 & Mask;
+}
+
+TH_ERROR LocoNetThrottle::setFunction (uint8_t Function, uint8_t Value)
+{
+    uint8_t Mask;
+    uint8_t OpCode;
+    uint8_t Data;
+
+    if (_state == TH_ST_IN_USE)
+    {
+        if (Function <= 4)
         {
-            bitMask = 0x01;
-            pInData = &pMsg->d5;
-            pBits = &pMsg->pxct2;
+            OpCode = OPC_LOCO_DIRF;
+            Data = _dirFunc0to4;
+            Mask = (uint8_t) (1 << ( (Function) ? Function - 1 : 4));
         }
         else
         {
-            bitMask <<= 1;
-            pInData++;
+            OpCode = OPC_LOCO_SND;
+            Data = _func5to8;
+            Mask = (uint8_t) (1 << (Function - 5));
         }
-    }
-}
 
-void encodePeerData (peerXferMsg *pMsg, uint8_t *pInData)
-{
-    uint8_t	bitMask = 0x01;
-    uint8_t	* pOutData = &pMsg->d1;
-    uint8_t	* pBits = &pMsg->pxct1;
-    for (uint8_t index = 0; index < 8; index++)
-    {
-        *pOutData = pInData[index] & 0x7F;	// fixed SBor040102
-        if (pInData[index] & 0x80)
+        if (Value)
         {
-            *pBits |= bitMask;
-        }
-        if (index == 3)
-        {
-            bitMask = 0x01;
-            pOutData = &pMsg->d5;
-            pBits = &pMsg->pxct2;
+            Data |= Mask;
         }
         else
         {
-            bitMask <<= 1;
-            pOutData++;
+            Data &= (uint8_t) ~Mask;
         }
+
+        _locoNet->send (OpCode, _slot, Data);
+
+        _ticksSinceLastAction = 0;
+        return TH_ER_OK;
     }
+
+    if (throttleErrorCallback)
+    {
+        throttleErrorCallback (this, TH_ER_NOT_SELECTED);
+    }
+    return TH_ER_NOT_SELECTED;
 }
 
-SV_STATUS LocoNetSystemVariable::processMessage (const lnMsg *rxPacket)
+TH_ERROR LocoNetThrottle::setDirFunc0to4Direct (uint8_t Value)
 {
-    SV_Addr_t unData;
-
-    lnMsg copy = *rxPacket;
-    lnMsg *LnPacket = &copy;
-
-    if ( (LnPacket->sv.mesg_size != 0x10) ||
-            (LnPacket->sv.command != OPC_PEER_XFER) ||
-            (LnPacket->sv.sv_type != 0x02) ||
-            (LnPacket->sv.sv_cmd & 0x40) ||
-            ( (LnPacket->sv.svx1 & 0xF0) != 0x10) ||
-            ( (LnPacket->sv.svx2 & 0xF0) != 0x10))
+    if (_state == TH_ST_IN_USE)
     {
-        return SV_NOT_CONSUMED;
-    }
-    decodePeerData (&LnPacket->px, unData.abPlain);
-    DEBUG ("LNSV Src: %d  Dest: %d  CMD: %x", LnPacket->sv.src, unData.stDecoded.unDestinationId.w, LnPacket->sv.sv_cmd);
-    if ( (LnPacket->sv.sv_cmd != SV_DISCOVER) &&
-            (LnPacket->sv.sv_cmd != SV_CHANGE_ADDRESS) &&
-            (unData.stDecoded.unDestinationId.w != readSVNodeId()))
-    {
-        #ifdef DEBUG_SV
-        Serial.print ("LNSV Dest Not Equal: ");
-        Serial.println (readSVNodeId());
-        #endif
-        return SV_NOT_CONSUMED;
+        _locoNet->send (OPC_LOCO_DIRF, _slot, Value & 0x7F);
+        return TH_ER_OK;
     }
 
-    switch (LnPacket->sv.sv_cmd)
+    if (throttleErrorCallback)
     {
-    case SV_WRITE_SINGLE:
-        if (!CheckAddressRange (unData.stDecoded.unMfgIdDevIdOrSvAddress.w, 1)) return SV_ERROR;
-        writeSVStorage (unData.stDecoded.unMfgIdDevIdOrSvAddress.w, unData.abPlain[4]);
-    // fall through intended!
-    case SV_READ_SINGLE:
-        if (!CheckAddressRange (unData.stDecoded.unMfgIdDevIdOrSvAddress.w, 1)) return SV_ERROR;
-        unData.abPlain[4] = readSVStorage (unData.stDecoded.unMfgIdDevIdOrSvAddress.w);
-        break;
-    case SV_WRITE_MASKED:
-        if (!CheckAddressRange (unData.stDecoded.unMfgIdDevIdOrSvAddress.w, 1)) return SV_ERROR;
-        // new scope for temporary local variables only
-        {
-            unsigned char ucOld = readSVStorage (unData.stDecoded.unMfgIdDevIdOrSvAddress.w) & (~unData.abPlain[5]);
-            unsigned char ucNew = unData.abPlain[4] & unData.abPlain[5];
-            writeSVStorage (unData.stDecoded.unMfgIdDevIdOrSvAddress.w, ucOld | ucNew);
-        }
-        unData.abPlain[4] = readSVStorage (unData.stDecoded.unMfgIdDevIdOrSvAddress.w);
-        break;
-    case SV_WRITE_QUAD:
-        if (!CheckAddressRange (unData.stDecoded.unMfgIdDevIdOrSvAddress.w, 4)) return SV_ERROR;
-        writeSVStorage (unData.stDecoded.unMfgIdDevIdOrSvAddress.w+0, unData.abPlain[4]);
-        writeSVStorage (unData.stDecoded.unMfgIdDevIdOrSvAddress.w+1, unData.abPlain[5]);
-        writeSVStorage (unData.stDecoded.unMfgIdDevIdOrSvAddress.w+2, unData.abPlain[6]);
-        writeSVStorage (unData.stDecoded.unMfgIdDevIdOrSvAddress.w+3, unData.abPlain[7]);
-    // fall through intended!
-    case SV_READ_QUAD:
-        if (!CheckAddressRange (unData.stDecoded.unMfgIdDevIdOrSvAddress.w, 4)) return SV_ERROR;
-        unData.abPlain[4] = readSVStorage (unData.stDecoded.unMfgIdDevIdOrSvAddress.w+0);
-        unData.abPlain[5] = readSVStorage (unData.stDecoded.unMfgIdDevIdOrSvAddress.w+1);
-        unData.abPlain[6] = readSVStorage (unData.stDecoded.unMfgIdDevIdOrSvAddress.w+2);
-        unData.abPlain[7] = readSVStorage (unData.stDecoded.unMfgIdDevIdOrSvAddress.w+3);
-        break;
-    case SV_DISCOVER:
-        _deferredSrcAddr = LnPacket->sv.src;
-        _deferredProcessingRequired = 1;
-        return SV_DEFERRED_PROCESSING_NEEDED;
-        break;
-    case SV_IDENTIFY:
-        unData.stDecoded.unDestinationId.w            = readSVNodeId();
-        unData.stDecoded.unMfgIdDevIdOrSvAddress.b.hi = _devId;
-        unData.stDecoded.unMfgIdDevIdOrSvAddress.b.lo = _mfgId;
-        unData.stDecoded.unproductId.w                = _productId;
-        unData.stDecoded.unSerialNumber.b.lo          = readSVStorage (SV_ADDR_SERIAL_NUMBER_L);
-        unData.stDecoded.unSerialNumber.b.hi          = readSVStorage (SV_ADDR_SERIAL_NUMBER_H);
-        break;
-    case SV_CHANGE_ADDRESS:
-        if ( (_mfgId != unData.stDecoded.unMfgIdDevIdOrSvAddress.b.lo) || (_devId != unData.stDecoded.unMfgIdDevIdOrSvAddress.b.hi))
-            return SV_NOT_CONSUMED; // not addressed
-        if (_productId != unData.stDecoded.unproductId.w)
-            return SV_NOT_CONSUMED; // not addressed
-        if (readSVStorage (SV_ADDR_SERIAL_NUMBER_L) != unData.stDecoded.unSerialNumber.b.lo)
-            return SV_NOT_CONSUMED; // not addressed
-        if (readSVStorage (SV_ADDR_SERIAL_NUMBER_H) != unData.stDecoded.unSerialNumber.b.hi)
-            return SV_NOT_CONSUMED; // not addressed
+        throttleErrorCallback (this, TH_ER_NOT_SELECTED);
+    }
+    return TH_ER_NOT_SELECTED;
+}
 
-        if (writeSVNodeId (unData.stDecoded.unDestinationId.w) != unData.stDecoded.unDestinationId.w)
-        {
-            // failed to change address in non-volatile memory (not implemented or failed to write)
-            _locoNet.send (OPC_LONG_ACK, (OPC_PEER_XFER & 0x7F), 44);
-            return SV_CONSUMED_OK; // the LN reception was ok, we processed the message
-        }
-        break;
-    case SV_RECONFIGURE:
-        break;  // actual handling is done after sending out the reply
+TH_ERROR LocoNetThrottle::setFunc5to8Direct (uint8_t Value)
+{
+    if (_state == TH_ST_IN_USE)
+    {
+        _locoNet->send (OPC_LOCO_SND, _slot, Value & 0x7F);
+        return TH_ER_OK;
+    }
+
+    if (throttleErrorCallback)
+    {
+        throttleErrorCallback (this, TH_ER_NOT_SELECTED);
+    }
+    return TH_ER_NOT_SELECTED;
+}
+
+TH_STATE LocoNetThrottle::getState (void)
+{
+    return _state;
+}
+
+
+const char *LocoNetThrottle::getStateStr (TH_STATE State)
+{
+    switch (State)
+    {
+    case TH_ST_FREE:
+        return "Free";
+
+    case TH_ST_IDLE:
+        return "Idle";
+
+    case TH_ST_RELEASE:
+        return "Release";
+
+    case TH_ST_ACQUIRE:
+        return "Acquire";
+
+    case TH_ST_SELECT:
+        return "Select";
+
+    case TH_ST_DISPATCH:
+        return "Dispatch";
+
+    case TH_ST_SLOT_MOVE:
+        return "Slot Move";
+
+    case TH_ST_SLOT_FORCE_FREE:
+        return "Slot Force Free";
+
+    case TH_ST_SLOT_RESUME:
+        return "Slot Resume";
+
+    case TH_ST_SLOT_STEAL:
+        return "Slot Steal";
+
+    case TH_ST_IN_USE:
+        return "In Use";
+
     default:
-        _locoNet.send (OPC_LONG_ACK, (OPC_PEER_XFER & 0x7F),43); // not yet implemented
-        return SV_ERROR;
+        return "Unknown";
     }
-
-    encodePeerData (&LnPacket->px, unData.abPlain); // recycling the received packet
-    LnPacket->sv.sv_cmd |= 0x40;    // flag the message as reply
-    LN_STATUS lnStatus = _locoNet.send (LnPacket);
-    DEBUG ("LNSV Send Response - Status: %d", lnStatus);
-
-    if (lnStatus != LN_IDLE)
-    {
-        // failed to send the SV reply message.  Send will NOT be re-tried.
-        _locoNet.send (OPC_LONG_ACK, (OPC_PEER_XFER & 0x7F), 44); // indicate failure to send the reply
-    }
-
-    if (LnPacket->sv.sv_cmd == (SV_RECONFIGURE | 0x40))
-    {
-        reconfigure();
-    }
-
-    return SV_CONSUMED_OK;
 }
 
-SV_STATUS LocoNetSystemVariable::doDeferredProcessing()
+const char *LocoNetThrottle::getErrorStr (TH_ERROR Error)
 {
-    if (_deferredProcessingRequired)
+    switch (Error)
     {
-        lnMsg msg;
-        SV_Addr_t unData;
-
-        msg.sv.command = OPC_PEER_XFER;
-        msg.sv.mesg_size = 0x10;
-        msg.sv.src = _deferredSrcAddr;
-        msg.sv.sv_cmd = SV_DISCOVER | 0x40;
-        msg.sv.sv_type = 0x02;
-        msg.sv.svx1 = 0x10;
-        msg.sv.svx2 = 0x10;
-
-        unData.stDecoded.unDestinationId.w            = readSVNodeId();
-        unData.stDecoded.unMfgIdDevIdOrSvAddress.b.lo = _mfgId;
-        unData.stDecoded.unMfgIdDevIdOrSvAddress.b.hi = _devId;
-        unData.stDecoded.unproductId.w                = _productId;
-        unData.stDecoded.unSerialNumber.b.lo          = readSVStorage (SV_ADDR_SERIAL_NUMBER_L);
-        unData.stDecoded.unSerialNumber.b.hi          = readSVStorage (SV_ADDR_SERIAL_NUMBER_H);
-
-        encodePeerData (&msg.px, unData.abPlain);
-
-        if (_locoNet.send (&msg) != LN_IDLE)
-        {
-            return SV_DEFERRED_PROCESSING_NEEDED;
-        }
-        _deferredProcessingRequired = false;
+    case TH_ER_OK:
+        return "Ok";
+    case TH_ER_SLOT_IN_USE:
+        return "In Use";
+    case TH_ER_BUSY:
+        return "Busy";
+    case TH_ER_NOT_SELECTED:
+        return "Not Sel";
+    case TH_ER_NO_LOCO:
+        return "No Loco";
+    case TH_ER_NO_SLOTS:
+        return "No Free Slots";
+    default:
+        return "Unknown";
     }
-    return SV_CONSUMED_OK;
 }
 
+TH_SPEED_STEPS LocoNetThrottle::getSpeedSteps (void)
+{
+    return _speedSteps;
+}
+
+void LocoNetThrottle::setSpeedSteps (TH_SPEED_STEPS newSpeedSteps)
+{
+    _speedSteps = newSpeedSteps;
+    if ( (_state == TH_ST_IN_USE) && ( (_status1 & 0x07) != _speedSteps))
+    {
+        _status1 = (_status1 & 0xf8) | _speedSteps;
+        _locoNet->send (OPC_SLOT_STAT1, _slot, _status1);
+    }
+    updateSpeedSteps (_speedSteps, 1);
+}
+
+const char* LocoNetThrottle::getSpeedStepStr (TH_SPEED_STEPS speedStep)
+{
+    switch (speedStep)
+    {
+    case TH_SP_ST_28:	  // 000=28 step/ 3 BYTE PKT regular mode
+        return "28";
+
+    case TH_SP_ST_28_TRI:  // 001=28 step. Generate Trinary packets for this Mobile ADR
+        return "28 Tri";
+
+    case TH_SP_ST_14:      // 010=14 step MODE
+        return "14";
+
+    case TH_SP_ST_128:     // 011=send 128 speed mode packets
+        return "128";
+
+    case TH_SP_ST_28_ADV:  // 100=28 Step decoder ,Allow Advanced DCC consisting
+        return "28 Adv";
+
+    case TH_SP_ST_128_ADV: // 111=128 Step decoder, Allow Advanced DCC consisting
+        return "128 Adv";
+    }
+
+    return "Unknown";
+}
