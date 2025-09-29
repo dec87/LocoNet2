@@ -62,6 +62,6 @@ public:
     }
 
 private:
-    std::vector<MsgConsumer*, MAX_CONSUMERS> consumers;
+    std::vector<MsgConsumer*> consumers;
 };
 
